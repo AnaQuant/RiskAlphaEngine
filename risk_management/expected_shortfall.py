@@ -145,4 +145,35 @@ class ExpectedShortfallEngine:
             })
         
         return pd.DataFrame(rolling_results).set_index('date')
+
+
+    def summary_statistics(self, returns: Optional[pd.Series] = None) -> Dict:
+        """
+        Calculate comprehensive summary statistics.
+
+        Args:
+            returns: Return series (uses portfolio returns if None)
+
+        Returns:
+            Dictionary with summary statistics
+        """
+        if returns is None:
+            if self.portfolio_returns is None:
+                raise ValueError("No return data available.")
+            returns = self.portfolio_returns
+
+        return {
+            'observations': len(returns),
+            'mean_return': returns.mean(),
+            'std_return': returns.std(),
+            'annualized_return': returns.mean() * 252,
+            'annualized_volatility': returns.std() * np.sqrt(252),
+            'sharpe_ratio': (returns.mean() * 252) / (returns.std() * np.sqrt(252)),
+            'skewness': returns.skew(),
+            'kurtosis': returns.kurtosis(),
+            'min_return': returns.min(),
+            'max_return': returns.max(),
+            'var_95_1d': np.percentile(returns, 5),
+            'var_99_1d': np.percentile(returns, 1)
+        }
     
