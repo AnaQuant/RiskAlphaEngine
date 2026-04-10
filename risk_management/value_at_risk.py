@@ -94,22 +94,24 @@ class VaREngine:
             'lambda_ewma': lambda_ewma
         }
     
-    def monte_carlo_var(self, returns: pd.Series, n_simulations: int = 10000, 
-                       distribution: str = 'normal') -> Dict:
+    def monte_carlo_var(self, returns: pd.Series, n_simulations: int = 10000,
+                       distribution: str = 'normal', random_state: int = 42) -> Dict:
         """
         Monte Carlo VaR using simulated returns
-        
+
         Args:
             returns: Portfolio return series
             n_simulations: Number of Monte Carlo simulations
             distribution: 'normal' or 't' for Student-t distribution
-            
+            random_state: Random seed for reproducibility
+
         Returns:
             Dictionary with VaR, Expected Shortfall, and metadata
         """
+        np.random.seed(random_state)
         mean_return = returns.mean()
         vol = returns.std()
-        
+
         if distribution == 'normal':
             # Normal distribution simulation
             simulated_returns = np.random.normal(mean_return, vol, n_simulations)
@@ -136,6 +138,108 @@ class VaREngine:
             'volatility': vol
         }
     
+    def backtest_var(self, returns: pd.Series, var_series: pd.Series) -> Dict:
+        """
+        Backtest VaR forecasts against realised returns.
+
+        Args:
+            returns:    Realised return series (pd.Series with DatetimeIndex).
+            var_series: Rolling VaR forecasts aligned to the same index (negative values).
+
+        Returns:
+            Dict with breach series, Kupiec test statistics, Basel zone, and breach details.
+        """
+        aligned = pd.DataFrame({'ret': returns, 'var': var_series}).dropna()
+        breaches = aligned['ret'] < aligned['var']
+        n_breaches = int(breaches.sum())
+        T = len(aligned)
+        expected_breaches = self.alpha * T
+        breach_rate = n_breaches / T if T > 0 else 0.0
+
+        # Kupiec (1995) proportional-of-failures Z-statistic
+        se = np.sqrt(self.alpha * (1 - self.alpha) / T) if T > 0 else np.nan
+        kupiec_z = (breach_rate - self.alpha) / se if T > 0 else np.nan
+        kupiec_pvalue = float(2 * (1 - stats.norm.cdf(abs(kupiec_z)))) if not np.isnan(kupiec_z) else np.nan
+
+        # Basel traffic-light zone (based on 250-day window convention)
+        if n_breaches <= 4:
+            basel_zone = 'Green'
+        elif n_breaches <= 9:
+            basel_zone = 'Yellow'
+        else:
+            basel_zone = 'Red'
+
+        breach_days = aligned[breaches].copy()
+        breach_details = pd.DataFrame({
+            'return': breach_days['ret'],
+            'VaR': breach_days['var'],
+            'excess': breach_days['ret'] - breach_days['var'],
+        })
+
+        return {
+            'breaches': breaches,
+            'n_breaches': n_breaches,
+            'expected_breaches': expected_breaches,
+            'breach_rate': breach_rate,
+            'kupiec_z': kupiec_z,
+            'kupiec_pvalue': kupiec_pvalue,
+            'basel_zone': basel_zone,
+            'breach_details': breach_details,
+        }
+
+    def christoffersen_test(self, breaches: pd.Series) -> Dict:
+        """
+        Christoffersen (1998) independence test for breach clustering.
+
+        Tests whether VaR breaches are independently distributed or cluster in time.
+        LR_ind ~ chi-squared(1) under H0 of independence.
+
+        Args:
+            breaches: Boolean pd.Series of breach indicators (True = breach).
+
+        Returns:
+            Dict with lr_stat, p_value, transition counts, and conditional breach rates.
+        """
+        b = breaches.astype(int).values
+        n00 = n01 = n10 = n11 = 0
+        for i in range(1, len(b)):
+            prev, curr = b[i - 1], b[i]
+            if prev == 0 and curr == 0:
+                n00 += 1
+            elif prev == 0 and curr == 1:
+                n01 += 1
+            elif prev == 1 and curr == 0:
+                n10 += 1
+            else:
+                n11 += 1
+
+        p0 = n01 / (n00 + n01) if (n00 + n01) > 0 else 0.0
+        p1 = n11 / (n10 + n11) if (n10 + n11) > 0 else 0.0
+        total = n00 + n01 + n10 + n11
+        p_hat = (n01 + n11) / total if total > 0 else 0.0
+
+        def _slog(x: float) -> float:
+            return np.log(x) if x > 1e-12 else 0.0
+
+        ll_unrestricted = (
+            n00 * _slog(1 - p0) + n01 * _slog(p0)
+            + n10 * _slog(1 - p1) + n11 * _slog(p1)
+        )
+        ll_restricted = (
+            (n00 + n10) * _slog(1 - p_hat)
+            + (n01 + n11) * _slog(p_hat)
+        )
+        lr_stat = float(-2 * (ll_restricted - ll_unrestricted))
+        lr_stat = max(lr_stat, 0.0)
+        p_value = float(1 - stats.chi2.cdf(lr_stat, df=1))
+
+        return {
+            'lr_stat': lr_stat,
+            'p_value': p_value,
+            'n00': n00, 'n01': n01, 'n10': n10, 'n11': n11,
+            'p0': p0, 'p1': p1,
+        }
+
     def _calculate_ewma_variance(self, returns: pd.Series, lambda_ewma: float) -> float:
         """Calculate EWMA variance (RiskMetrics methodology)"""
         if len(returns) == 0:
@@ -228,8 +332,12 @@ class PortfolioRiskAnalyzer:
             'Simulations': mc_t_result['n_simulations']
         })
         
-        return pd.DataFrame(results)
-    
+        df = pd.DataFrame(results).set_index('Method')
+        # Only keep columns that are populated for every row
+        common_cols = ['VaR_%', 'VaR_Dollar', 'ES_%', 'ES_Dollar']
+        extra_cols = [c for c in df.columns if c not in common_cols]
+        return df[common_cols + extra_cols].fillna('—')
+
     def rolling_var_analysis(self, portfolio_returns: pd.Series, 
                            method: str = 'historical', window: int = 250) -> pd.DataFrame:
         """

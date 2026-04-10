@@ -368,16 +368,136 @@ class PortfolioStressTester:
 
         returns = np.array(returns)
 
+        n = len(returns)
+        var_reliable = n >= 30
+        var_note = (
+            'Reliable' if var_reliable
+            else f'Unreliable: only {n} scenario(s). Statistical VaR requires ≥30 observations. '
+                 'See var_demo.ipynb for rigorous VaR estimation.'
+        )
+
         return {
-            'scenarios_count': len(scenarios),
+            'scenarios_count': n,
             'mean_return': np.mean(returns),
             'volatility': np.std(returns),
             'min_return': np.min(returns),
             'max_return': np.max(returns),
-            'var_95': np.percentile(returns, 5),  # 95% VaR
-            'var_99': np.percentile(returns, 1),  # 99% VaR
-            'scenarios_negative': np.sum(returns < 0),
-            'scenarios_positive': np.sum(returns > 0)
+            'var_95': np.percentile(returns, 5),  # 95% VaR — unreliable for n < 30
+            'var_99': np.percentile(returns, 1),  # 99% VaR — unreliable for n < 30
+            'var_reliable': var_reliable,
+            'var_note': var_note,
+            'scenarios_negative': int(np.sum(returns < 0)),
+            'scenarios_positive': int(np.sum(returns > 0)),
+        }
+
+    def sensitivity_sweep(self, scenario_name: str,
+                          scale_factors: List[float] = None) -> pd.DataFrame:
+        """
+        Scale a scenario's shocks by each factor and return a P&L table.
+
+        Args:
+            scenario_name:  Name of an existing scenario in self.stress_scenarios.
+            scale_factors:  List of multipliers to apply to all shocks.
+                            Default: [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 2.00].
+
+        Returns:
+            DataFrame with columns: scale_factor, total_pnl, total_return_pct,
+            worst_position, worst_position_pnl.
+        """
+        if scale_factors is None:
+            scale_factors = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 2.00]
+
+        if scenario_name not in self.stress_scenarios:
+            raise ValueError(f"Scenario '{scenario_name}' not found.")
+
+        base_shocks = self.stress_scenarios[scenario_name]['shocks']
+        base_desc   = self.stress_scenarios[scenario_name].get('description', '')
+        base_type   = self.stress_scenarios[scenario_name].get('type', 'hypothetical')
+
+        rows = []
+        for sf in scale_factors:
+            scaled_name = f'__sweep_{scenario_name}_{sf}__'
+            scaled_shocks = {asset: shock * sf for asset, shock in base_shocks.items()}
+            self.stress_scenarios[scaled_name] = {
+                'shocks': scaled_shocks, 'description': base_desc, 'type': base_type
+            }
+            result = self.run_stress_test(scaled_name)
+
+            # Find worst position
+            worst_asset = min(result['position_pnl'],
+                              key=lambda a: result['position_pnl'][a]['pnl'],
+                              default=None)
+            worst_pnl = result['position_pnl'][worst_asset]['pnl'] if worst_asset else 0.0
+
+            rows.append({
+                'scale_factor':       sf,
+                'total_pnl':          result['total_pnl'],
+                'total_return_pct':   result['total_return_pct'],
+                'worst_position':     worst_asset,
+                'worst_position_pnl': worst_pnl,
+            })
+
+            # Clean up temporary scenario
+            del self.stress_scenarios[scaled_name]
+            if scaled_name in self.results:
+                del self.results[scaled_name]
+
+        return pd.DataFrame(rows)
+
+    def reverse_stress_test(self, target_loss_pct: float,
+                            scenario_name: str,
+                            tolerance: float = 0.001) -> Dict:
+        """
+        Find the shock scale factor that produces a given portfolio loss.
+
+        Uses bisection search between scale=0 and scale=5 (max 50 iterations).
+
+        Args:
+            target_loss_pct:  Target total portfolio return in percent (e.g. -20.0).
+            scenario_name:    Name of the base scenario whose shocks will be scaled.
+            tolerance:        Convergence tolerance in percentage points (default 0.1pp).
+
+        Returns:
+            Dict with scale_factor, required_shocks, target_loss_pct, achieved_loss_pct.
+        """
+        if scenario_name not in self.stress_scenarios:
+            raise ValueError(f"Scenario '{scenario_name}' not found.")
+
+        base_shocks = self.stress_scenarios[scenario_name]['shocks']
+
+        def _pnl_at_scale(sf: float) -> float:
+            tmp_name = f'__rev__{scenario_name}__{sf}__'
+            self.stress_scenarios[tmp_name] = {
+                'shocks': {a: s * sf for a, s in base_shocks.items()},
+                'description': '', 'type': 'hypothetical'
+            }
+            result = self.run_stress_test(tmp_name)
+            pct = result['total_return_pct']
+            del self.stress_scenarios[tmp_name]
+            if tmp_name in self.results:
+                del self.results[tmp_name]
+            return pct
+
+        lo, hi = 0.0, 5.0
+        for _ in range(50):
+            mid = (lo + hi) / 2.0
+            pct = _pnl_at_scale(mid)
+            if abs(pct - target_loss_pct) <= tolerance:
+                break
+            # For losses (negative target): larger scale → more negative P&L
+            if pct > target_loss_pct:
+                lo = mid
+            else:
+                hi = mid
+
+        achieved = _pnl_at_scale(mid)
+        required_shocks = {a: s * mid for a, s in base_shocks.items()}
+
+        return {
+            'scale_factor':      mid,
+            'required_shocks':   required_shocks,
+            'target_loss_pct':   target_loss_pct,
+            'achieved_loss_pct': achieved,
         }
 
     def export_results(self, filename: str = None) -> str:
